@@ -39,6 +39,11 @@ prompt = "User request flows through frontend -> api -> database"
 diagram = generate_diagram(prompt)
 print(diagram.render(include_markup=True))
 ```
+Set the Fireworks API key before running the LLM helper:
+
+```bash
+export FIREWORKS_API_KEY="fw_xxx"
+```
 
 ### Combined workflow demonstration
 
