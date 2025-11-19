@@ -1,25 +1,39 @@
 import heapq
 import shutil
 from collections import deque, defaultdict
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 from wcwidth import wcwidth
 
 from ..errors import ConfigurationError, DiagramError, LayoutOverflowError
 from .canvas import Canvas
-from .core import BoxChars, Position
+from .core import BoxChars, Position, Shape
 from .grid_layout import GridLayout
 from .edge import Edge
 from .node import Node
+from ..agent.fireworks_client import FireworksError, chat_completion
+
+
+_DEFAULT_LLM_SYSTEM_PROMPT = "You are a helpful assistant. Provide concise, factual answers to the user's request."
 
 
 class Diagram:
-
     def __init__(
         self,
         root_text: str,
         max_box_width: Optional[int] = 36,
-        max_layout_width: Optional[int] = 80,
+        max_layout_width: Optional[int] = None,
         allow_intersections: bool = False,
         vertical_spacing: int = 4,
         horizontal_spacing: int = 4,
@@ -27,6 +41,10 @@ class Diagram:
         canvas_height: Optional[int] = None,
         connector_style: Optional[str] = None,
         box_style: Optional[Union[str, BoxChars]] = None,
+        llm_client: Optional[Callable[..., Dict[str, Any]]] = None,
+        llm_client_kwargs: Optional[Dict[str, Any]] = None,
+        llm_system_prompt: Optional[str] = None,
+        auto_fit_terminal: bool = True,
     ):
         if not isinstance(root_text, str):
             raise ConfigurationError("root_text must be a string.")
@@ -43,23 +61,44 @@ class Diagram:
         if connector_style is not None and not isinstance(connector_style, str):
             raise ConfigurationError("connector_style must be a string when provided.")
 
-        self.root = Node(root_text)
+        if not isinstance(auto_fit_terminal, bool):
+            raise ConfigurationError("auto_fit_terminal must be a boolean value.")
+
+        self.root = Node(root_text, shape=Shape.RECTANGLE)
 
         if isinstance(box_style, BoxChars):
             self.chars = box_style
         else:
             style_key = box_style or "rounded"
             if not isinstance(style_key, str):
-                raise ConfigurationError("box_style must be a string or BoxChars instance.")
+                raise ConfigurationError(
+                    "box_style must be a string or BoxChars instance."
+                )
             try:
                 self.chars = BoxChars.for_style(style_key)
             except ValueError as exc:
                 raise ConfigurationError(str(exc)) from exc
         self.v_spacing = max(1, vertical_spacing)
         self.h_spacing = max(1, horizontal_spacing)
+        terminal_cols = None
+        if auto_fit_terminal:
+            try:
+                terminal_cols = shutil.get_terminal_size(fallback=(0, 0)).columns
+            except OSError:
+                terminal_cols = 0
+            if terminal_cols is not None and terminal_cols <= 0:
+                terminal_cols = None
+
+        resolved_layout_width = max_layout_width
+        if resolved_layout_width is None and terminal_cols:
+            resolved_layout_width = max(24, terminal_cols - 4)
+        if resolved_layout_width is None:
+            resolved_layout_width = 80
+
         self.max_box_width = max_box_width
-        self.max_layout_width = max_layout_width
-        self._current_layout_width = max_layout_width
+        self.max_layout_width = resolved_layout_width
+        self._current_layout_width = resolved_layout_width
+        max_layout_width = resolved_layout_width
         self._effective_max_box_width = max_box_width
         if not isinstance(allow_intersections, bool):
             raise ConfigurationError("allow_intersections must be a boolean value.")
@@ -67,16 +106,30 @@ class Diagram:
         self._canvas_width_config = canvas_width
         self._canvas_height_config = canvas_height
         if canvas_width is not None and canvas_width < 32:
-            raise ConfigurationError("canvas_width must be at least 32 characters when specified.")
+            raise ConfigurationError(
+                "canvas_width must be at least 32 characters when specified."
+            )
         if canvas_height is not None and canvas_height < 32:
-            raise ConfigurationError("canvas_height must be at least 32 characters when specified.")
-        self.canvas_width = max(32, canvas_width) if canvas_width is not None else 200
-        self.canvas_height = max(32, canvas_height) if canvas_height is not None else 1000
+            raise ConfigurationError(
+                "canvas_height must be at least 32 characters when specified."
+            )
+        resolved_canvas_width = canvas_width
+        if resolved_canvas_width is None and terminal_cols:
+            resolved_canvas_width = max(terminal_cols, resolved_layout_width + 16)
+        if resolved_canvas_width is None:
+            resolved_canvas_width = 200
+        self.canvas_width = max(32, resolved_canvas_width)
+        self.canvas_height = (
+            max(32, canvas_height) if canvas_height is not None else 1000
+        )
         self._edges: List[Edge] = []
         self._edge_state: Dict[Tuple[int, int], Dict[str, object]] = {}
         self.connector_style = connector_style
         self._manual_layout: Optional[Tuple[str, object]] = None
         self._grid_min_nodes = 8
+        self.llm_client = llm_client
+        self.llm_client_kwargs = dict(llm_client_kwargs or {})
+        self.llm_system_prompt = llm_system_prompt or _DEFAULT_LLM_SYSTEM_PROMPT
 
         if max_box_width is not None and max_box_width < 10:
             raise ConfigurationError("max_box_width must be at least 10 characters.")
@@ -87,7 +140,9 @@ class Diagram:
             and max_layout_width is not None
             and max_layout_width < max_box_width
         ):
-            raise ConfigurationError("max_layout_width must be greater than or equal to max_box_width.")
+            raise ConfigurationError(
+                "max_layout_width must be greater than or equal to max_box_width."
+            )
         self.root.diagram = self
 
     def _prepare_node(self, node: Node):
@@ -114,6 +169,15 @@ class Diagram:
         node.box_width = inner_width + 4
         if effective_width:
             node.box_width = min(node.box_width, effective_width)
+
+        if getattr(node, "title", None):
+            title_tokens = self._tokenize_markup(node.title)
+            node.title_tokens = title_tokens
+            title_width = sum(token[2] for token in title_tokens if token[0] == "text")
+            node.box_width = max(node.box_width, title_width + 4)
+        else:
+            node.title_tokens = []
+
         node.height = len(lines_tokens) + 2
         node.subtree_height = node.height
         node.subtree_min_x = 0
@@ -145,7 +209,9 @@ class Diagram:
             i += 1
         return tokens
 
-    def _wrap_tokens(self, tokens: List[Tuple[str, str, int]], limit: Optional[int]) -> List[List[Tuple[str, str, int]]]:
+    def _wrap_tokens(
+        self, tokens: List[Tuple[str, str, int]], limit: Optional[int]
+    ) -> List[List[Tuple[str, str, int]]]:
         if not tokens:
             return [[]]
 
@@ -222,7 +288,9 @@ class Diagram:
 
         for child in children:
             child_width = child.subtree_width
-            additional = child_width if not current_row else self.h_spacing + child_width
+            additional = (
+                child_width if not current_row else self.h_spacing + child_width
+            )
             if current_row and current_width + additional > limit:
                 rows.append(current_row)
                 current_row = [child]
@@ -288,7 +356,9 @@ class Diagram:
         }
         return mapping.get(key, self.chars.cross)
 
-    def _write_dirs(self, canvas: Canvas, x: int, y: int, dirs: set, style: Optional[str] = None):
+    def _write_dirs(
+        self, canvas: Canvas, x: int, y: int, dirs: set, style: Optional[str] = None
+    ):
         if style is None:
             style = self.connector_style
         existing_dirs = self._char_to_dirs(canvas.get(x, y))
@@ -311,9 +381,13 @@ class Diagram:
         max_x = node.box_width
         node.subtree_height = node.height
 
-        right_children = [child for child, pos in child_extents if pos == Position.RIGHT]
+        right_children = [
+            child for child, pos in child_extents if pos == Position.RIGHT
+        ]
         left_children = [child for child, pos in child_extents if pos == Position.LEFT]
-        bottom_children = [child for child, pos in child_extents if pos == Position.BOTTOM]
+        bottom_children = [
+            child for child, pos in child_extents if pos == Position.BOTTOM
+        ]
         top_children = [child for child, pos in child_extents if pos == Position.TOP]
 
         for child in left_children:
@@ -336,7 +410,9 @@ class Diagram:
             max_extent = node.height
 
             for row in row_groups:
-                row_width = sum(child.subtree_width for child in row) + self.h_spacing * (len(row) - 1)
+                row_width = sum(
+                    child.subtree_width for child in row
+                ) + self.h_spacing * (len(row) - 1)
                 start_x = node.box_width // 2 - row_width // 2
                 current_x = start_x
                 for child in row:
@@ -356,7 +432,9 @@ class Diagram:
         if top_children:
             row_groups = self._group_bottom_children(top_children)
             for row in row_groups:
-                row_width = sum(child.subtree_width for child in row) + self.h_spacing * (len(row) - 1)
+                row_width = sum(
+                    child.subtree_width for child in row
+                ) + self.h_spacing * (len(row) - 1)
                 start_x = node.box_width // 2 - row_width // 2
                 current_x = start_x
                 for child in row:
@@ -387,20 +465,79 @@ class Diagram:
         node.subtree_max_x = max_x
         node.subtree_width = max_x - min_x
 
-    def add(self, text: str, position: Position = Position.BOTTOM) -> Node:
-        return self.root.add(text, position)
+    def _resolve_llm_answer(
+        self,
+        query: str,
+        call_kwargs: Dict[str, Any],
+        *,
+        llm_system_prompt: Optional[str] = None,
+    ) -> str:
+        client = self.llm_client or chat_completion
+        payload_kwargs: Dict[str, Any] = dict(self.llm_client_kwargs)
+        if call_kwargs:
+            payload_kwargs.update(call_kwargs)
 
-    def add_bottom(self, text: str) -> Node:
-        return self.root.add_bottom(text)
+        system_prompt = llm_system_prompt or self.llm_system_prompt
 
-    def add_right(self, text: str) -> Node:
-        return self.root.add_right(text)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": query},
+        ]
 
-    def add_left(self, text: str) -> Node:
-        return self.root.add_left(text)
+        try:
+            response = client(messages, **payload_kwargs)
+        except FireworksError as exc:
+            raise DiagramError(f"LLM client error: {exc}") from exc
+        except Exception as exc:
+            raise DiagramError(f"LLM client error: {exc}") from exc
 
-    def add_top(self, text: str) -> Node:
-        return self.root.add_top(text)
+        return self._extract_llm_content(response)
+
+    @staticmethod
+    def _extract_llm_content(response: Mapping[str, Any]) -> str:
+        if not isinstance(response, Mapping):
+            raise DiagramError("LLM response must be a JSON mapping.")
+
+        choices = response.get("choices")
+        if not isinstance(choices, Sequence) or not choices:
+            raise DiagramError("LLM response does not have a choices list.")
+
+        first = choices[0]
+        if not isinstance(first, Mapping):
+            raise DiagramError("Invalid choice format in LLM response.")
+
+        message = first.get("message")
+        if not isinstance(message, Mapping):
+            raise DiagramError("LLM response does not provide a message.")
+
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise DiagramError("LLM answer content must be a string.")
+
+        return content.strip()
+
+    def add(self, text: str, position: Position = Position.BOTTOM, **kwargs) -> Node:
+        return self.root.add(text, position, **kwargs)
+
+    def add_bottom(self, text: str, **kwargs) -> Node:
+        return self.root.add_bottom(text, **kwargs)
+
+    def add_right(self, text: str, **kwargs) -> Node:
+        return self.root.add_right(text, **kwargs)
+
+    def add_left(self, text: str, **kwargs) -> Node:
+        return self.root.add_left(text, **kwargs)
+
+    def add_top(self, text: str, **kwargs) -> Node:
+        return self.root.add_top(text, **kwargs)
+
+    def add_llm_answer(
+        self,
+        query: str,
+        position: Position = Position.BOTTOM,
+        **kwargs,
+    ) -> Node:
+        return self.root.add_llm_answer(query, position, **kwargs)
 
     def connect(
         self,
@@ -412,17 +549,109 @@ class Diagram:
         style: Optional[str] = None,
     ) -> Edge:
         if not isinstance(source, Node) or not isinstance(target, Node):
-            raise DiagramError("source dan target harus berupa Node.")
+            raise DiagramError("source and target must be Node instances.")
         if source.diagram is not self or target.diagram is not self:
-            raise DiagramError("Node tidak berasal dari diagram ini.")
+            raise DiagramError("Node does not belong to this diagram.")
         if style is None:
             style = self.connector_style
-        edge = Edge(source=source, target=target, label=label, bidirectional=bidirectional, style=style)
+        edge = Edge(
+            source=source,
+            target=target,
+            label=label,
+            bidirectional=bidirectional,
+            style=style,
+        )
         self._edges.append(edge)
         return edge
 
     def clear_edges(self) -> None:
         self._edges.clear()
+
+    def validate(self) -> List[str]:
+        issues: List[str] = []
+        seen: Set[int] = set()
+
+        def walk(node: Node, path: Tuple[str, ...]):
+            node_id = id(node)
+            if node_id in seen:
+                issues.append(
+                    "Cycle detected: node %s is referenced multiple times."
+                    % (" -> ".join(path),)
+                )
+                return
+            seen.add(node_id)
+
+            for index, (child, _) in enumerate(node.children):
+                if child.parent is not node:
+                    issues.append(
+                        f"Parent mismatch: child at index {index} expects {child.parent!r} but is linked from {node!r}."
+                    )
+                if child.diagram is not self:
+                    issues.append(
+                        f"Foreign node detected: child at index {index} does not belong to this diagram."
+                    )
+                walk(child, path + (child.text or f"<child-{index}>",))
+
+        walk(self.root, (self.root.text or "<root>",))
+        return issues
+
+    def subdiagram(self, node: Node, depth: Optional[int] = None) -> "Diagram":
+        if node.diagram is not self:
+            raise DiagramError("Node does not belong to this diagram.")
+
+        new_diagram = Diagram(
+            node.text,
+            max_box_width=self.max_box_width,
+            max_layout_width=self.max_layout_width,
+            allow_intersections=self.allow_intersections,
+            vertical_spacing=self.v_spacing,
+            horizontal_spacing=self.h_spacing,
+            canvas_width=self._canvas_width_config,
+            canvas_height=self._canvas_height_config,
+            connector_style=self.connector_style,
+            box_style=self.chars,
+            llm_client=self.llm_client,
+            llm_client_kwargs=dict(self.llm_client_kwargs),
+            llm_system_prompt=self.llm_system_prompt,
+        )
+
+        node_map: Dict[Node, Node] = {node: new_diagram.root}
+
+        def clone(src: Node, dst: Node, level: int):
+            if depth is not None and level >= depth:
+                return
+            for child, position in src.children:
+                new_child = dst.add(
+                    child.text, position, title=getattr(child, "title", None)
+                )
+                node_map[child] = new_child
+                clone(child, new_child, level + 1)
+
+        clone(node, new_diagram.root, 0)
+
+        for edge in self._edges:
+            src_new = node_map.get(edge.source)
+            dst_new = node_map.get(edge.target)
+            if src_new is None or dst_new is None:
+                continue
+            new_diagram.connect(
+                src_new,
+                dst_new,
+                label=edge.label,
+                bidirectional=edge.bidirectional,
+                style=edge.style,
+            )
+        return new_diagram
+
+    def render_subtree(
+        self,
+        node: Node,
+        *,
+        depth: Optional[int] = None,
+        include_markup: bool = False,
+    ) -> str:
+        sub = self.subdiagram(node, depth)
+        return sub.render(include_markup=include_markup)
 
     def _calculate_layout(self):
         self._effective_max_box_width = self.max_box_width
@@ -445,7 +674,11 @@ class Diagram:
                     ).apply()
                     return
 
-            if not layout_limit or self.root.subtree_width <= layout_limit or not self._effective_max_box_width:
+            if (
+                not layout_limit
+                or self.root.subtree_width <= layout_limit
+                or not self._effective_max_box_width
+            ):
                 break
             if self._effective_max_box_width <= 14:
                 break
@@ -457,7 +690,9 @@ class Diagram:
         self.root.x = 0
         self.root.y = 0
         total_nodes = self._count_nodes(self.root)
-        use_grid_layout = self._manual_layout is None and self._should_use_grid_layout(self.root, total_nodes, True)
+        use_grid_layout = self._manual_layout is None and self._should_use_grid_layout(
+            self.root, total_nodes, True
+        )
         if use_grid_layout:
             self._layout_grid(self.root)
         else:
@@ -471,7 +706,9 @@ class Diagram:
             total += self._count_nodes(child)
         return total
 
-    def _should_use_grid_layout(self, node: Node, total_nodes: int, is_root: bool) -> bool:
+    def _should_use_grid_layout(
+        self, node: Node, total_nodes: int, is_root: bool
+    ) -> bool:
         if not node.children:
             return True
         if is_root and total_nodes <= self._grid_min_nodes:
@@ -497,9 +734,13 @@ class Diagram:
             normalized_row: List[Node] = []
             for node in row:
                 if not isinstance(node, Node):
-                    raise ConfigurationError("Grid layout entries must be Node instances.")
+                    raise ConfigurationError(
+                        "Grid layout entries must be Node instances."
+                    )
                 if node.diagram is not self:
-                    raise ConfigurationError("Grid layout node does not belong to this diagram.")
+                    raise ConfigurationError(
+                        "Grid layout node does not belong to this diagram."
+                    )
                 if node in seen:
                     raise ConfigurationError("Grid layout nodes must be unique.")
                 seen.add(node)
@@ -568,8 +809,12 @@ class Diagram:
         if not node.children:
             return
 
-        bottom_children = [child for child, pos in node.children if pos == Position.BOTTOM]
-        right_children = [child for child, pos in node.children if pos == Position.RIGHT]
+        bottom_children = [
+            child for child, pos in node.children if pos == Position.BOTTOM
+        ]
+        right_children = [
+            child for child, pos in node.children if pos == Position.RIGHT
+        ]
         left_children = [child for child, pos in node.children if pos == Position.LEFT]
         top_children = [child for child, pos in node.children if pos == Position.TOP]
 
@@ -597,7 +842,9 @@ class Diagram:
             all_right_edges: List[int] = []
 
             for row in row_groups:
-                row_width = sum(child.subtree_width for child in row) + self.h_spacing * (len(row) - 1)
+                row_width = sum(
+                    child.subtree_width for child in row
+                ) + self.h_spacing * (len(row) - 1)
                 start_x = node.x + (node.box_width // 2) - (row_width // 2)
                 current_x = start_x
                 entries = []
@@ -614,13 +861,16 @@ class Diagram:
                 row_layouts.append((entries, row_height))
 
             branch_left = min(all_left_edges) if all_left_edges else node.x
-            branch_right = max(all_right_edges) if all_right_edges else node.x + node.box_width
+            branch_right = (
+                max(all_right_edges) if all_right_edges else node.x + node.box_width
+            )
 
             base_y = node.y - self.v_spacing - 1
             overlapping_side_children = [
                 child
                 for child in right_children + left_children
-                if child.x <= branch_right and (child.x + child.box_width - 1) >= branch_left
+                if child.x <= branch_right
+                and (child.x + child.box_width - 1) >= branch_left
             ]
             if overlapping_side_children:
                 side_min_top = min(child.y for child in overlapping_side_children)
@@ -649,7 +899,9 @@ class Diagram:
             all_right_edges: List[int] = []
 
             for row in row_groups:
-                row_width = sum(child.subtree_width for child in row) + self.h_spacing * (len(row) - 1)
+                row_width = sum(
+                    child.subtree_width for child in row
+                ) + self.h_spacing * (len(row) - 1)
                 start_x = node.x + (node.box_width // 2) - (row_width // 2)
                 current_x = start_x
                 entries = []
@@ -672,10 +924,14 @@ class Diagram:
             overlapping_side_children = [
                 child
                 for child in right_children + left_children
-                if child.x <= branch_right and (child.x + child.box_width - 1) >= branch_left
+                if child.x <= branch_right
+                and (child.x + child.box_width - 1) >= branch_left
             ]
             if overlapping_side_children:
-                side_max_bottom = max(child.y + child.subtree_height for child in overlapping_side_children)
+                side_max_bottom = max(
+                    child.y + child.subtree_height
+                    for child in overlapping_side_children
+                )
                 base_y = max(base_y, side_max_bottom + self.v_spacing)
 
             current_y = base_y
@@ -704,7 +960,14 @@ class Diagram:
         for child, _ in node.children:
             self._shift_subtree(child, dy)
 
-    def _occupy_rect(self, occupied: Dict[int, List[Tuple[int, int]]], x0: int, x1: int, y0: int, y1: int):
+    def _occupy_rect(
+        self,
+        occupied: Dict[int, List[Tuple[int, int]]],
+        x0: int,
+        x1: int,
+        y0: int,
+        y1: int,
+    ):
         if x0 > x1 or y0 > y1:
             return
         for y in range(y0, y1 + 1):
@@ -719,7 +982,9 @@ class Diagram:
                     merged[-1][1] = max(merged[-1][1], end)
             occupied[y] = [(start, end) for start, end in merged]
 
-    def _segment_blocked(self, occupied: Dict[int, List[Tuple[int, int]]], y: int, x0: int, x1: int) -> bool:
+    def _segment_blocked(
+        self, occupied: Dict[int, List[Tuple[int, int]]], y: int, x0: int, x1: int
+    ) -> bool:
         if x0 > x1:
             x0, x1 = x1, x0
         for start, end in occupied.get(y, []):
@@ -763,11 +1028,15 @@ class Diagram:
                 branch_y = max_allowed
 
     def _collect_rects(self, node: Node, rects: List[Tuple[int, int, int, int]]):
-        rects.append((node.x, node.x + node.box_width - 1, node.y, node.y + node.height - 1))
+        rects.append(
+            (node.x, node.x + node.box_width - 1, node.y, node.y + node.height - 1)
+        )
         for child, _ in node.children:
             self._collect_rects(child, rects)
 
-    def _subtree_overlap_delta(self, node: Node, occupied: Dict[int, List[Tuple[int, int]]]) -> int:
+    def _subtree_overlap_delta(
+        self, node: Node, occupied: Dict[int, List[Tuple[int, int]]]
+    ) -> int:
         rects: List[Tuple[int, int, int, int]] = []
         self._collect_rects(node, rects)
         delta = 0
@@ -784,7 +1053,9 @@ class Diagram:
             if not collision:
                 return delta
 
-    def _compute_row_overlap_delta(self, children: List[Node], occupied: Dict[int, List[Tuple[int, int]]]) -> int:
+    def _compute_row_overlap_delta(
+        self, children: List[Node], occupied: Dict[int, List[Tuple[int, int]]]
+    ) -> int:
         max_delta = 0
         for child in children:
             max_delta = max(max_delta, self._subtree_overlap_delta(child, occupied))
@@ -819,9 +1090,17 @@ class Diagram:
                     self._occupy_rect(occupied, min_x, max_x, branch_y, branch_y)
                     child_bottom = child_node.y + child_node.height - 1
                     if child_bottom + 1 <= branch_y - 1:
-                        self._occupy_rect(occupied, child_center, child_center, child_bottom + 1, branch_y - 1)
+                        self._occupy_rect(
+                            occupied,
+                            child_center,
+                            child_center,
+                            child_bottom + 1,
+                            branch_y - 1,
+                        )
 
-        bottom_children = [child for child, pos in node.children if pos == Position.BOTTOM]
+        bottom_children = [
+            child for child, pos in node.children if pos == Position.BOTTOM
+        ]
         if bottom_children:
             rows: Dict[int, List[Node]] = {}
             for child in bottom_children:
@@ -835,7 +1114,9 @@ class Diagram:
                 if branch_y is None:
                     branch_y = node.y + node.height + 1
                 while True:
-                    branch_y = self._ensure_branch_row_clear(node, row_children, branch_y, occupied)
+                    branch_y = self._ensure_branch_row_clear(
+                        node, row_children, branch_y, occupied
+                    )
                     row_delta = self._compute_row_overlap_delta(row_children, occupied)
                     if row_delta:
                         for child in row_children:
@@ -856,7 +1137,13 @@ class Diagram:
                     min_x, max_x = sorted((parent_center, child_center))
                     self._occupy_rect(occupied, min_x, max_x, branch_y, branch_y)
                     if child.y > branch_y + 1:
-                        self._occupy_rect(occupied, child_center, child_center, branch_y + 1, child.y - 1)
+                        self._occupy_rect(
+                            occupied,
+                            child_center,
+                            child_center,
+                            branch_y + 1,
+                            child.y - 1,
+                        )
 
         for child, pos in sorted(node.children, key=lambda item: item[0].x):
             if pos == Position.TOP:
@@ -872,13 +1159,31 @@ class Diagram:
         self._auto_avoid_node(self.root, occupied)
 
     def _draw_box(self, canvas: Canvas, node: Node):
+        shape = getattr(node, "shape", Shape.RECTANGLE)
+
+        if shape == Shape.RECTANGLE:
+            self._draw_rectangle(canvas, node)
+        elif shape == Shape.DIAMOND:
+            self._draw_diamond(canvas, node)
+        elif shape == Shape.CIRCLE:
+            self._draw_circle(canvas, node)
+        elif shape == Shape.HEXAGON:
+            self._draw_hexagon(canvas, node)
+        elif shape == Shape.DOUBLE_BOX:
+            self._draw_double_box(canvas, node)
+        else:
+            self._draw_rectangle(canvas, node)
+
+    def _draw_rectangle(self, canvas: Canvas, node: Node):
         x, y = node.x, node.y
         w = node.box_width
         inner_width = w - 2
         tokens_lines = getattr(node, "tokens_lines", None)
         if not tokens_lines:
             plain_line = node.text if node.text else ""
-            tokens_lines = [[("text", char, max(wcwidth(char), 1)) for char in plain_line]]
+            tokens_lines = [
+                [("text", char, max(wcwidth(char), 1)) for char in plain_line]
+            ]
         content_height = len(tokens_lines)
         bottom_y = y + content_height + 1
 
@@ -886,6 +1191,36 @@ class Diagram:
         for i in range(1, w - 1):
             canvas.set(x + i, y, self.chars.horizontal)
         canvas.set(x + w - 1, y, self.chars.top_right)
+
+        if getattr(node, "title_tokens", None):
+            title_tokens = node.title_tokens
+            avail = w - 2
+            display_width = sum(
+                token[2] for token in title_tokens if token[0] == "text"
+            )
+            if display_width <= avail and display_width > 0:
+                start = x + 1 + max(0, (avail - display_width) // 2)
+                cursor = start
+                pending_tags: List[str] = []
+                for kind, value, width in title_tokens:
+                    if kind == "newline":
+                        break
+                    if kind == "tag":
+                        if value.startswith("[/"):
+                            canvas.insert_markup(cursor, y, value)
+                        else:
+                            pending_tags.append(value)
+                        continue
+                    glyph_width = max(width, 1)
+                    if cursor - start + glyph_width > avail:
+                        break
+                    canvas.set(cursor, y, value, width=glyph_width)
+                    for tag in pending_tags:
+                        canvas.insert_markup(cursor, y, tag)
+                    pending_tags.clear()
+                    cursor += glyph_width
+                for tag in pending_tags:
+                    canvas.insert_markup(cursor, y, tag)
 
         for idx, line_tokens in enumerate(tokens_lines):
             line_y = y + 1 + idx
@@ -922,7 +1257,161 @@ class Diagram:
             canvas.set(x + i, bottom_y, self.chars.horizontal)
         canvas.set(x + w - 1, bottom_y, self.chars.bottom_right)
 
-    def _edge_anchor(self, node: Node, other: Node, outgoing: bool, prefer_horizontal: bool) -> Tuple[int, int, str]:
+    def _draw_diamond(self, canvas: Canvas, node: Node):
+        x, y = node.x, node.y
+        w = node.box_width
+        h = node.height
+        center_x = x + w // 2
+        center_y = y + h // 2
+
+        # Draw diamond shape
+        canvas.set(center_x, y, "◊")
+        canvas.set(x, center_y, "◊")
+        canvas.set(center_x, y + h - 1, "◊")
+        canvas.set(x + w - 1, center_y, "◊")
+
+        # Draw diamond edges
+        for i in range(1, w // 2):
+            if y + i < center_y:
+                canvas.set(center_x - i, y + i, "╱")
+                canvas.set(center_x + i, y + i, "╲")
+            if y + h - 1 - i > center_y:
+                canvas.set(center_x - i, y + h - 1 - i, "╲")
+                canvas.set(center_x + i, y + h - 1 - i, "╱")
+
+        # Draw text in center
+        text_lines = node.text.split("\n") if node.text else [""]
+        for idx, line in enumerate(text_lines):
+            if idx + center_y < y + h - 1:
+                text_x = center_x - len(line) // 2
+                for char_idx, char in enumerate(line):
+                    if 0 <= text_x + char_idx - x < w:
+                        canvas.set(text_x + char_idx, center_y + idx, char)
+
+    def _draw_circle(self, canvas: Canvas, node: Node):
+        x, y = node.x, node.y
+        w = node.box_width
+        h = node.height
+        center_x = x + w // 2
+        center_y = y + h // 2
+        radius = min(w, h) // 2 - 1
+
+        # Draw circle using box drawing characters
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius * 2, radius * 2 + 1):
+                px = center_x + dx // 2
+                py = center_y + dy
+
+                distance_sq = dx * dx // 4 + dy * dy
+                if abs(distance_sq - radius * radius) <= radius:
+                    if px >= x and px < x + w and py >= y and py < y + h:
+                        canvas.set(
+                            px,
+                            py,
+                            "●" if distance_sq <= (radius - 1) * (radius - 1) else "○",
+                        )
+
+        # Draw text in center
+        text_lines = node.text.split("\n") if node.text else [""]
+        for idx, line in enumerate(text_lines):
+            if idx + center_y < y + h:
+                text_x = center_x - len(line) // 2
+                for char_idx, char in enumerate(line):
+                    if 0 <= text_x + char_idx - x < w:
+                        canvas.set(text_x + char_idx, center_y + idx, char)
+
+    def _draw_hexagon(self, canvas: Canvas, node: Node):
+        x, y = node.x, node.y
+        w = node.box_width
+        h = node.height
+
+        # Draw hexagon outline
+        third = w // 3
+        canvas.set(x + third, y, "╱")
+        for i in range(third):
+            canvas.set(x + third + i, y, "─")
+        canvas.set(x + 2 * third, y, "╲")
+
+        canvas.set(x, y + h // 2, "│")
+        canvas.set(x + w - 1, y + h // 2, "│")
+
+        canvas.set(x + third, y + h - 1, "╲")
+        for i in range(third):
+            canvas.set(x + third + i, y + h - 1, "─")
+        canvas.set(x + 2 * third, y + h - 1, "╱")
+
+        # Fill sides
+        for row in range(1, h - 1):
+            canvas.set(x, y + row, "│")
+            canvas.set(x + w - 1, y + row, "│")
+
+        # Draw text in center
+        text_lines = node.text.split("\n") if node.text else [""]
+        center_y = y + h // 2
+        for idx, line in enumerate(text_lines):
+            if center_y + idx < y + h - 1:
+                text_x = x + w // 2 - len(line) // 2
+                for char_idx, char in enumerate(line):
+                    if 0 <= text_x + char_idx - x < w:
+                        canvas.set(text_x + char_idx, center_y + idx, char)
+
+    def _draw_double_box(self, canvas: Canvas, node: Node):
+        x, y = node.x, node.y
+        w = node.box_width
+        inner_width = w - 2
+        tokens_lines = getattr(node, "tokens_lines", None)
+        if not tokens_lines:
+            plain_line = node.text if node.text else ""
+            tokens_lines = [
+                [("text", char, max(wcwidth(char), 1)) for char in plain_line]
+            ]
+        content_height = len(tokens_lines)
+        bottom_y = y + content_height + 1
+
+        # Draw double-line border
+        canvas.set(x, y, "╔")
+        for i in range(1, w - 1):
+            canvas.set(x + i, y, "═")
+        canvas.set(x + w - 1, y, "╗")
+
+        for idx, line_tokens in enumerate(tokens_lines):
+            line_y = y + 1 + idx
+            canvas.set(x, line_y, "║")
+            canvas.set(x + w - 1, line_y, "║")
+
+            for i in range(inner_width):
+                canvas.set(x + 1 + i, line_y, " ")
+
+            display_width = sum(token[2] for token in line_tokens if token[0] == "text")
+            padding = 0
+            if display_width < inner_width:
+                padding = (inner_width - display_width) // 2
+            cursor = x + 1 + padding
+            pending_tags: List[str] = []
+            for kind, value, width in line_tokens:
+                if kind == "tag":
+                    if value.startswith("[/"):
+                        canvas.insert_markup(cursor, line_y, value)
+                    else:
+                        pending_tags.append(value)
+                    continue
+                glyph_width = max(width, 1)
+                canvas.set(cursor, line_y, value, width=glyph_width)
+                for tag in pending_tags:
+                    canvas.insert_markup(cursor, line_y, tag)
+                pending_tags.clear()
+                cursor += glyph_width
+            for tag in pending_tags:
+                canvas.insert_markup(cursor, line_y, tag)
+
+        canvas.set(x, bottom_y, "╚")
+        for i in range(1, w - 1):
+            canvas.set(x + i, bottom_y, "═")
+        canvas.set(x + w - 1, bottom_y, "╝")
+
+    def _edge_anchor(
+        self, node: Node, other: Node, outgoing: bool, prefer_horizontal: bool
+    ) -> Tuple[int, int, str]:
         center_x = node.x + node.box_width // 2
         center_y = node.y + node.height // 2
         other_center_x = other.x + other.box_width // 2
@@ -948,7 +1437,9 @@ class Diagram:
             x = center_x
         return x, y, direction
 
-    def _edge_path(self, start: Tuple[int, int], end: Tuple[int, int], prefer_horizontal: bool) -> List[Tuple[int, int]]:
+    def _edge_path(
+        self, start: Tuple[int, int], end: Tuple[int, int], prefer_horizontal: bool
+    ) -> List[Tuple[int, int]]:
         sx, sy = start
         ex, ey = end
         points: List[Tuple[int, int]] = [start]
@@ -967,7 +1458,9 @@ class Diagram:
                 simplified.append(pt)
         return simplified
 
-    def _dirs_to_corner(self, prev: Tuple[int, int], cur: Tuple[int, int], nxt: Tuple[int, int]) -> Optional[str]:
+    def _dirs_to_corner(
+        self, prev: Tuple[int, int], cur: Tuple[int, int], nxt: Tuple[int, int]
+    ) -> Optional[str]:
         dx1 = cur[0] - prev[0]
         dy1 = cur[1] - prev[1]
         dx2 = nxt[0] - cur[0]
@@ -1017,7 +1510,11 @@ class Diagram:
             if style and not existing.get("style"):
                 existing["style"] = style
         else:
-            data: Dict[str, object] = {"dirs": {incoming, outgoing}, "is_corner": True, "arrow": None}
+            data: Dict[str, object] = {
+                "dirs": {incoming, outgoing},
+                "is_corner": True,
+                "arrow": None,
+            }
             if style:
                 data["style"] = style
             self._edge_state[(x, y)] = data
@@ -1051,7 +1548,9 @@ class Diagram:
             y = y0
             while y != y1:
                 key = (x0, y)
-                state = self._edge_state.setdefault(key, {"dirs": set(), "is_corner": False, "arrow": None})
+                state = self._edge_state.setdefault(
+                    key, {"dirs": set(), "is_corner": False, "arrow": None}
+                )
                 if style and "style" not in state:
                     state["style"] = style
                 state["dirs"].update({"up", "down"})
@@ -1061,13 +1560,15 @@ class Diagram:
             x = x0
             while x != x1:
                 key = (x, y0)
-                state = self._edge_state.setdefault(key, {"dirs": set(), "is_corner": False, "arrow": None})
+                state = self._edge_state.setdefault(
+                    key, {"dirs": set(), "is_corner": False, "arrow": None}
+                )
                 if style and "style" not in state:
                     state["style"] = style
                 state["dirs"].update({"left", "right"})
                 x += step
         else:
-            raise DiagramError("Edge segment harus ortogonal.")
+            raise DiagramError("Edge segment must be orthogonal.")
 
     def _opposite_dir(self, direction: str) -> str:
         mapping = {"up": "down", "down": "up", "left": "right", "right": "left"}
@@ -1116,7 +1617,10 @@ class Diagram:
             dy = cur[1] - prev[1]
             if dx == 0 and dy == 0:
                 continue
-            direction = (0 if dx == 0 else dx // abs(dx), 0 if dy == 0 else dy // abs(dy))
+            direction = (
+                0 if dx == 0 else dx // abs(dx),
+                0 if dy == 0 else dy // abs(dy),
+            )
             if prev_dir is not None and direction != prev_dir:
                 simplified.append(prev)
             prev = cur
@@ -1150,7 +1654,9 @@ class Diagram:
             return True
         return False
 
-    def _smooth_path(self, path: List[Tuple[int, int]], blocked: Set[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    def _smooth_path(
+        self, path: List[Tuple[int, int]], blocked: Set[Tuple[int, int]]
+    ) -> List[Tuple[int, int]]:
         if len(path) <= 2:
             return path
         smoothed: List[Tuple[int, int]] = [path[0]]
@@ -1160,9 +1666,8 @@ class Diagram:
             current_point = path[i]
             next_point = path[i + 1]
             if (
-                (prev_point[0] == next_point[0] or prev_point[1] == next_point[1])
-                and self._segment_clear_for_smoothing(prev_point, next_point, blocked)
-            ):
+                prev_point[0] == next_point[0] or prev_point[1] == next_point[1]
+            ) and self._segment_clear_for_smoothing(prev_point, next_point, blocked):
                 i += 1
                 continue
             smoothed.append(current_point)
@@ -1189,7 +1694,9 @@ class Diagram:
         close_tag = "[/]"
         return open_tag, close_tag
 
-    def _apply_style(self, canvas: Canvas, x: int, y: int, style: Optional[str]) -> None:
+    def _apply_style(
+        self, canvas: Canvas, x: int, y: int, style: Optional[str]
+    ) -> None:
         tokens = self._style_tokens(style)
         if not tokens:
             return
@@ -1197,7 +1704,9 @@ class Diagram:
         canvas.insert_markup(x, y, open_tag, position="prefix")
         canvas.insert_markup(x, y, close_tag, position="suffix")
 
-    def _set_connector_char(self, canvas: Canvas, x: int, y: int, char: str, style: Optional[str]) -> None:
+    def _set_connector_char(
+        self, canvas: Canvas, x: int, y: int, char: str, style: Optional[str]
+    ) -> None:
         canvas.set(x, y, char)
         if style:
             self._apply_style(canvas, x, y, style)
@@ -1220,9 +1729,15 @@ class Diagram:
                 next_corner = path[i + 1]
                 after = path[i + 2]
 
-                dir1 = self._direction_from_step(corner[0] - prev_pt[0], corner[1] - prev_pt[1])
-                dir2 = self._direction_from_step(next_corner[0] - corner[0], next_corner[1] - corner[1])
-                dir3 = self._direction_from_step(after[0] - next_corner[0], after[1] - next_corner[1])
+                dir1 = self._direction_from_step(
+                    corner[0] - prev_pt[0], corner[1] - prev_pt[1]
+                )
+                dir2 = self._direction_from_step(
+                    next_corner[0] - corner[0], next_corner[1] - corner[1]
+                )
+                dir3 = self._direction_from_step(
+                    after[0] - next_corner[0], after[1] - next_corner[1]
+                )
 
                 if not dir1 or not dir2 or not dir3:
                     i += 1
@@ -1240,7 +1755,9 @@ class Diagram:
                     ):
                         dx_after = after[0] - candidate[0]
                         dy_after = after[1] - candidate[1]
-                        if ((dx_after == 0) ^ (dy_after == 0)) and (dx_after or dy_after):
+                        if ((dx_after == 0) ^ (dy_after == 0)) and (
+                            dx_after or dy_after
+                        ):
                             if self._direction_from_step(dx_after, dy_after) == dir2:
                                 new_path = path[: i + 1] + [candidate] + path[i + 2 :]
                                 path = new_path
@@ -1281,7 +1798,9 @@ class Diagram:
                 px, py = queue.popleft()
                 for dx, dy in moves:
                     nx, ny = px + dx, py + dy
-                    if not (0 <= nx < self.canvas_width and 0 <= ny < self.canvas_height):
+                    if not (
+                        0 <= nx < self.canvas_width and 0 <= ny < self.canvas_height
+                    ):
                         continue
                     if (nx, ny) in seen:
                         continue
@@ -1326,7 +1845,9 @@ class Diagram:
                     if dx == 0 and dy == 0:
                         continue
                     nx, ny = x + dx, y + dy
-                    if not (0 <= nx < self.canvas_width and 0 <= ny < self.canvas_height):
+                    if not (
+                        0 <= nx < self.canvas_width and 0 <= ny < self.canvas_height
+                    ):
                         continue
                     if (nx, ny) in blocked:
                         penalty += 1
@@ -1363,13 +1884,22 @@ class Diagram:
             return penalty
 
         start_state = (start, None, None)
-        open_heap: List[Tuple[int, int, Tuple[int, int], Optional[str], Optional[str]]] = []
+        open_heap: List[
+            Tuple[int, int, Tuple[int, int], Optional[str], Optional[str]]
+        ] = []
         start_priority = heuristic(start)
         heapq.heappush(open_heap, (start_priority, 0, start, None, None))
 
-        came: Dict[Tuple[Tuple[int, int], Optional[str], Optional[str]], Tuple[Tuple[int, int], Optional[str], Optional[str]]] = {}
-        best_cost: Dict[Tuple[Tuple[int, int], Optional[str], Optional[str]], int] = {start_state: 0}
-        goal_state: Optional[Tuple[Tuple[int, int], Optional[str], Optional[str]]] = None
+        came: Dict[
+            Tuple[Tuple[int, int], Optional[str], Optional[str]],
+            Tuple[Tuple[int, int], Optional[str], Optional[str]],
+        ] = {}
+        best_cost: Dict[Tuple[Tuple[int, int], Optional[str], Optional[str]], int] = {
+            start_state: 0
+        }
+        goal_state: Optional[Tuple[Tuple[int, int], Optional[str], Optional[str]]] = (
+            None
+        )
 
         while open_heap:
             f_cost, g_cost, (x, y), prev_dir, prev_prev_dir = heapq.heappop(open_heap)
@@ -1408,13 +1938,17 @@ class Diagram:
                 best_cost[next_state] = next_cost
                 came[next_state] = current_state
                 priority = next_cost + heuristic((nx, ny))
-                heapq.heappush(open_heap, (priority, next_cost, (nx, ny), direction, prev_dir))
+                heapq.heappush(
+                    open_heap, (priority, next_cost, (nx, ny), direction, prev_dir)
+                )
 
         if goal_state is None:
             return None
 
         path: List[Tuple[int, int]] = []
-        state: Optional[Tuple[Tuple[int, int], Optional[str], Optional[str]]] = goal_state
+        state: Optional[Tuple[Tuple[int, int], Optional[str], Optional[str]]] = (
+            goal_state
+        )
         while state is not None:
             point, _, _ = state
             path.append(point)
@@ -1424,7 +1958,9 @@ class Diagram:
         path = self._smooth_path(path, blocked)
         return path
 
-    def _reserve_edge_track(self, occupied: Set[Tuple[int, int]], point: Tuple[int, int]) -> None:
+    def _reserve_edge_track(
+        self, occupied: Set[Tuple[int, int]], point: Tuple[int, int]
+    ) -> None:
         x, y = point
         if not (0 <= x < self.canvas_width and 0 <= y < self.canvas_height):
             return
@@ -1542,14 +2078,20 @@ class Diagram:
         dy = ty_center - sy_center
         prefer_horizontal = abs(dx) >= abs(dy)
 
-        start_x, start_y, start_dir = self._edge_anchor(source, target, True, prefer_horizontal)
-        end_x, end_y, end_dir = self._edge_anchor(target, source, False, prefer_horizontal)
+        start_x, start_y, start_dir = self._edge_anchor(
+            source, target, True, prefer_horizontal
+        )
+        end_x, end_y, end_dir = self._edge_anchor(
+            target, source, False, prefer_horizontal
+        )
 
         edge_style = edge.style or self.connector_style
 
         path_points = self._route_edge((start_x, start_y), (end_x, end_y), hard_blocked)
         if not path_points:
-            path_points = self._edge_path((start_x, start_y), (end_x, end_y), prefer_horizontal)
+            path_points = self._edge_path(
+                (start_x, start_y), (end_x, end_y), prefer_horizontal
+            )
         path_points = self._simplify_path(path_points)
 
         directions: List[Optional[str]] = []
@@ -1593,7 +2135,9 @@ class Diagram:
             self._reserve_edge_track(label_occupied, cell)
 
         end_key = (end_x, end_y)
-        entry = self._edge_state.setdefault(end_key, {"dirs": set(), "is_corner": False, "arrow": None})
+        entry = self._edge_state.setdefault(
+            end_key, {"dirs": set(), "is_corner": False, "arrow": None}
+        )
         if edge_style and not entry.get("style"):
             entry["style"] = edge_style
         if entry.get("arrow") is None:
@@ -1603,7 +2147,9 @@ class Diagram:
             entry["dirs"].add(self._opposite_dir(end_dir))
         if edge.bidirectional:
             start_key = (start_x, start_y)
-            entry_start = self._edge_state.setdefault(start_key, {"dirs": set(), "is_corner": False, "arrow": None})
+            entry_start = self._edge_state.setdefault(
+                start_key, {"dirs": set(), "is_corner": False, "arrow": None}
+            )
             if edge_style and not entry_start.get("style"):
                 entry_start["style"] = edge_style
             entry_start["arrow"] = self._opposite_dir(start_dir)
@@ -1628,7 +2174,9 @@ class Diagram:
             elif dirs:
                 self._set_connector_char(canvas, x, y, self._dirs_to_char(dirs), style)
 
-    def _draw_connector(self, canvas: Canvas, parent: Node, child: Node, position: Position):
+    def _draw_connector(
+        self, canvas: Canvas, parent: Node, child: Node, position: Position
+    ):
         style = self.connector_style
         if position == Position.BOTTOM:
             p_x = parent.x + parent.box_width // 2
@@ -1642,7 +2190,9 @@ class Diagram:
             if len(siblings) == 1:
                 for y in range(p_y, c_y - 1):
                     self._write_dirs(canvas, p_x, y, {"up", "down"})
-                self._set_connector_char(canvas, c_x, c_y - 1, self.chars.arrow_down, style)
+                self._set_connector_char(
+                    canvas, c_x, c_y - 1, self.chars.arrow_down, style
+                )
             else:
                 branch_groups = {}
                 for s in siblings:
@@ -1654,26 +2204,36 @@ class Diagram:
                     self._write_dirs(canvas, p_x, y, {"up", "down"})
 
                 for branch_y in sorted(branch_groups.keys()):
-                    row_children = sorted(branch_groups[branch_y], key=lambda n: n.x + n.box_width // 2)
+                    row_children = sorted(
+                        branch_groups[branch_y], key=lambda n: n.x + n.box_width // 2
+                    )
                     for child_node in row_children:
                         center = child_node.x + child_node.box_width // 2
                         if center > p_x:
                             for x_pos in range(p_x + 1, center):
-                                self._write_dirs(canvas, x_pos, branch_y, {"left", "right"})
+                                self._write_dirs(
+                                    canvas, x_pos, branch_y, {"left", "right"}
+                                )
                             self._write_dirs(canvas, p_x, branch_y, {"right"})
                             self._write_dirs(canvas, center, branch_y, {"down", "left"})
                         elif center < p_x:
                             for x_pos in range(center + 1, p_x):
-                                self._write_dirs(canvas, x_pos, branch_y, {"left", "right"})
+                                self._write_dirs(
+                                    canvas, x_pos, branch_y, {"left", "right"}
+                                )
                             self._write_dirs(canvas, p_x, branch_y, {"left"})
-                            self._write_dirs(canvas, center, branch_y, {"down", "right"})
+                            self._write_dirs(
+                                canvas, center, branch_y, {"down", "right"}
+                            )
                         else:
                             self._write_dirs(canvas, p_x, branch_y, {"down"})
 
                         s_y = child_node.y
                         for y_pos in range(branch_y + 1, s_y - 1):
                             self._write_dirs(canvas, center, y_pos, {"up", "down"})
-                        self._set_connector_char(canvas, center, s_y - 1, self.chars.arrow_down, style)
+                        self._set_connector_char(
+                            canvas, center, s_y - 1, self.chars.arrow_down, style
+                        )
 
         elif position == Position.RIGHT:
             p_x = parent.x + parent.box_width
@@ -1684,28 +2244,42 @@ class Diagram:
 
             if p_y == c_y:
                 for x in range(p_x, c_x - 1):
-                    self._set_connector_char(canvas, x, p_y, self.chars.horizontal, style)
-                self._set_connector_char(canvas, c_x - 1, c_y, self.chars.arrow_right, style)
+                    self._set_connector_char(
+                        canvas, x, p_y, self.chars.horizontal, style
+                    )
+                self._set_connector_char(
+                    canvas, c_x - 1, c_y, self.chars.arrow_right, style
+                )
             else:
                 corner_x = p_x + self.h_spacing // 2
 
                 for x in range(p_x, corner_x):
-                    self._set_connector_char(canvas, x, p_y, self.chars.horizontal, style)
+                    self._set_connector_char(
+                        canvas, x, p_y, self.chars.horizontal, style
+                    )
 
                 if c_y > p_y:
                     self._write_dirs(canvas, corner_x, p_y, {"left", "down"}, style)
                     for y in range(p_y + 1, c_y):
-                        self._set_connector_char(canvas, corner_x, y, self.chars.vertical, style)
+                        self._set_connector_char(
+                            canvas, corner_x, y, self.chars.vertical, style
+                        )
                     self._write_dirs(canvas, corner_x, c_y, {"up", "right"}, style)
                 else:
                     self._write_dirs(canvas, corner_x, p_y, {"left", "up"}, style)
                     for y in range(c_y + 1, p_y):
-                        self._set_connector_char(canvas, corner_x, y, self.chars.vertical, style)
+                        self._set_connector_char(
+                            canvas, corner_x, y, self.chars.vertical, style
+                        )
                     self._write_dirs(canvas, corner_x, c_y, {"down", "right"}, style)
 
                 for x in range(corner_x + 1, c_x - 1):
-                    self._set_connector_char(canvas, x, c_y, self.chars.horizontal, style)
-                self._set_connector_char(canvas, c_x - 1, c_y, self.chars.arrow_right, style)
+                    self._set_connector_char(
+                        canvas, x, c_y, self.chars.horizontal, style
+                    )
+                self._set_connector_char(
+                    canvas, c_x - 1, c_y, self.chars.arrow_right, style
+                )
 
         elif position == Position.LEFT:
             p_x = parent.x
@@ -1716,28 +2290,42 @@ class Diagram:
 
             if p_y == c_y:
                 for x in range(c_x + 1, p_x):
-                    self._set_connector_char(canvas, x, p_y, self.chars.horizontal, style)
-                self._set_connector_char(canvas, c_x + 1, c_y, self.chars.arrow_left, style)
+                    self._set_connector_char(
+                        canvas, x, p_y, self.chars.horizontal, style
+                    )
+                self._set_connector_char(
+                    canvas, c_x + 1, c_y, self.chars.arrow_left, style
+                )
             else:
                 corner_x = p_x - self.h_spacing // 2
 
                 for x in range(corner_x + 1, p_x):
-                    self._set_connector_char(canvas, x, p_y, self.chars.horizontal, style)
+                    self._set_connector_char(
+                        canvas, x, p_y, self.chars.horizontal, style
+                    )
 
                 if c_y > p_y:
                     self._write_dirs(canvas, corner_x, p_y, {"right", "down"}, style)
                     for y in range(p_y + 1, c_y):
-                        self._set_connector_char(canvas, corner_x, y, self.chars.vertical, style)
+                        self._set_connector_char(
+                            canvas, corner_x, y, self.chars.vertical, style
+                        )
                     self._write_dirs(canvas, corner_x, c_y, {"up", "left"}, style)
                 else:
                     self._write_dirs(canvas, corner_x, p_y, {"right", "up"}, style)
                     for y in range(c_y + 1, p_y):
-                        self._set_connector_char(canvas, corner_x, y, self.chars.vertical, style)
+                        self._set_connector_char(
+                            canvas, corner_x, y, self.chars.vertical, style
+                        )
                     self._write_dirs(canvas, corner_x, c_y, {"down", "left"}, style)
 
                 for x in range(c_x + 1, corner_x):
-                    self._set_connector_char(canvas, x, c_y, self.chars.horizontal, style)
-                self._set_connector_char(canvas, c_x + 1, c_y, self.chars.arrow_left, style)
+                    self._set_connector_char(
+                        canvas, x, c_y, self.chars.horizontal, style
+                    )
+                self._set_connector_char(
+                    canvas, c_x + 1, c_y, self.chars.arrow_left, style
+                )
 
         elif position == Position.TOP:
             p_x = parent.x + parent.box_width // 2
@@ -1757,7 +2345,9 @@ class Diagram:
                 self._write_dirs(canvas, p_x, y, {"up", "down"})
 
             for branch_y in sorted(branch_groups.keys(), reverse=True):
-                row_children = sorted(branch_groups[branch_y], key=lambda n: n.x + n.box_width // 2)
+                row_children = sorted(
+                    branch_groups[branch_y], key=lambda n: n.x + n.box_width // 2
+                )
                 for child_node in row_children:
                     center = child_node.x + child_node.box_width // 2
                     if center > p_x:
@@ -1776,7 +2366,9 @@ class Diagram:
                     c_bottom_local = child_node.y + child_node.height - 1
                     for y_pos in range(branch_y - 1, c_bottom_local, -1):
                         self._write_dirs(canvas, center, y_pos, {"up", "down"})
-                    self._set_connector_char(canvas, center, c_bottom_local + 1, self.chars.arrow_up, style)
+                    self._set_connector_char(
+                        canvas, center, c_bottom_local + 1, self.chars.arrow_up, style
+                    )
 
     def _draw_all_nodes(self, canvas: Canvas, node: Node):
         self._draw_box(canvas, node)
@@ -1848,7 +2440,11 @@ class Diagram:
             columns = shutil.get_terminal_size(fallback=(80, 24)).columns
             adjusted = columns - 6
             if adjusted >= 24:
-                effective_layout_width = min(effective_layout_width, adjusted) if effective_layout_width else adjusted
+                effective_layout_width = (
+                    min(effective_layout_width, adjusted)
+                    if effective_layout_width
+                    else adjusted
+                )
         self._current_layout_width = effective_layout_width
 
         original_canvas_width = self.canvas_width
@@ -1898,7 +2494,9 @@ class Diagram:
         page_width: Optional[int] = None,
         overlap: int = 0,
     ) -> List[str]:
-        text = self.render(include_markup=include_markup, fit_to_terminal=fit_to_terminal)
+        text = self.render(
+            include_markup=include_markup, fit_to_terminal=fit_to_terminal
+        )
         if not text:
             return [""]
 

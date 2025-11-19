@@ -24,10 +24,21 @@ api = diagram.add_right("API Gateway")
 worker = api.add_bottom("Worker Pool")
 store = worker.add_bottom("Data Store")
 
+# Optional titles show up on the box border
+api.title = "Layer 1"
+worker.title = "Compute"
+store.title = "Storage"
+
 diagram.connect(api, worker, label="dispatch")
 diagram.connect(worker, store, label="persist")
 
 print(diagram.render(include_markup=True))
+
+# Validate structure (returns [] when everything is consistent)
+print(diagram.validate())
+
+# Render only the worker branch
+print(diagram.render_subtree(worker))
 ```
 
 ### Generating diagrams from an LLM
@@ -39,6 +50,76 @@ prompt = "User request flows through frontend -> api -> database"
 diagram = generate_diagram(prompt)
 print(diagram.render(include_markup=True))
 ```
+
+### Embedding LLM answers inside existing diagrams
+
+Use the high-level `add_llm_answer()` helper to replace any node text with the live response from your LLM client. The helper automatically sets `llm_answer=True` and accepts the usual positioning helpers plus an optional per-node system prompt.
+
+```python
+from asciinode.ascii_diagram import Diagram, Position
+
+diagram = Diagram(
+    "Security Overview",
+    llm_system_prompt=(
+        "You are a cybersecurity analyst. Provide concise Indonesian answers with clear risk and mitigation notes."
+    ),
+)
+
+root = diagram.root
+
+summary = root.add_llm_answer(
+    "Ringkas hasil pemindaian nmap berikut dengan fokus risiko tertinggi:",
+    position=Position.RIGHT,
+)
+
+analysis = summary.add_llm_answer(
+    "Sebutkan CVE paling kritis dan jelaskan risikonya.",
+    position=Position.BOTTOM,
+    llm_system_prompt="Beri jawaban ringkas dalam bahasa Indonesia dengan bullet list.",
+)
+
+notes = analysis.add_left(
+    "Catatan manual",
+    llm_answer=False,  # ordinary text node, not replaced by the LLM
+)
+
+print(diagram.render(include_markup=True))
+```
+
+> **Tip**
+>
+> If you prefer the lower-level API, every `add_*()` method still accepts `llm_answer=True`, `llm_query=...`, and `llm_system_prompt=...` through keyword arguments. The `add_llm_answer()` convenience wrapper simply applies those flags for you.
+
+#### Using the lower-level API directly
+
+For advanced scenarios—such as reusing a single node for multiple queries, or injecting custom metadata—you can interact with the base `add_*()` methods manually. Provide the `llm_answer=True` flag and any overrides you need.
+
+```python
+from asciinode.ascii_diagram import Diagram, Position
+
+diagram = Diagram("Threat Brief")
+
+node = diagram.add_right(
+    "Initial prompt",  # will be replaced
+    llm_answer=True,
+    llm_query="Summarize the top three network risks in English.",
+    llm_system_prompt="You are a SOC analyst. Respond with a numbered list in English.",
+)
+
+follow_up = node.add_bottom(
+    "Detail follow-up",  # also replaced via LLM
+    llm_answer=True,
+    llm_query="For each risk above, give a mitigation in one sentence.",
+)
+
+manual_note = follow_up.add_left(
+    "Analyst note: verify mitigations",  # regular node, not LLM-backed
+)
+
+print(diagram.render(include_markup=True))
+```
+
+This approach gives you full control over prompts, system overrides, and when a node should remain plain text. The resulting diagram still records the original query (`node.llm_query`) and system prompt (`node.llm_system_prompt`) for later inspection.
 
 ### Combined workflow demonstration
 
@@ -194,7 +275,22 @@ Traceroute Analysis
 ```
 ## Examples
 
-Additional scripts demonstrating tree layouts, automation workflows, and live dashboards are available under the project root (see `advanced_tree_connections.py`, `automation_flow.py`, `neofetch.py`, and others).
+Comprehensive examples demonstrating various features are available in the `examples/` directory:
+
+- **Basic Examples**: `basic_example.py`, `main_demo.py`, `simple_grid.py`
+- **Architecture Diagrams**: `omnichannel_architecture_diagram.py`, `advanced_tree_connections.py`
+- **LLM Integration**: `live_llm_report.py`, `static_llm_report.py`, `pumpfun_agent_workflow.py`
+- **Advanced Features**: `diagram_diff_example.py`, `diagram_validate_example.py`, `automation_flow.py`
+- **Specialized Tools**: `neofetch.py`, `monitoring.py`, `crypto_map.py`
+
+Run examples with:
+```bash
+cd examples
+python3 basic_example.py
+python3 pumpfun_agent_workflow.py "coin pepe"
+```
+
+See `examples/README.md` for detailed descriptions and categories.
 
 ## License
 

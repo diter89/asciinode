@@ -3,16 +3,22 @@ from enum import Enum
 
 
 class Position(Enum):
-
     BOTTOM = "bottom"
     RIGHT = "right"
     LEFT = "left"
     TOP = "top"
 
 
+class Shape(Enum):
+    RECTANGLE = "rectangle"
+    DIAMOND = "diamond"
+    CIRCLE = "circle"
+    HEXAGON = "hexagon"
+    DOUBLE_BOX = "double_box"
+
+
 @dataclass
 class BoxChars:
-
     top_left: str = "╭"
     top_right: str = "╮"
     bottom_left: str = "╰"
@@ -68,5 +74,33 @@ class BoxChars:
                 arrow_right=">",
                 arrow_left="<",
                 arrow_up="^",
+            )
+        if key in {"double", "double-line", "doubleline"}:
+            return cls(
+                top_left="╔",
+                top_right="╗",
+                bottom_left="╚",
+                bottom_right="╝",
+                horizontal="═",
+                vertical="║",
+                tee_down="╦",
+                tee_up="╩",
+                tee_right="╠",
+                tee_left="╣",
+                cross="╬",
+            )
+        if key in {"heavy", "bold", "thick"}:
+            return cls(
+                top_left="┏",
+                top_right="┓",
+                bottom_left="┗",
+                bottom_right="┛",
+                horizontal="━",
+                vertical="┃",
+                tee_down="┳",
+                tee_up="┻",
+                tee_right="┣",
+                tee_left="┫",
+                cross="╋",
             )
         raise ValueError(f"Unknown box style: {style}")

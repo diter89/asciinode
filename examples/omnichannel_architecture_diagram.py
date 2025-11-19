@@ -9,7 +9,7 @@ class Diagram(BaseDiagram):
         super().__init__(*args, **kwargs)
 
 
-diagram = Diagram("OmniChannel Architecture (Chained)", max_layout_width=80, allow_intersections=False)
+diagram = Diagram("OmniChannel Architecture (Chained)", allow_intersections=True)
 
 mobile_net = diagram.add("Mobile Provider Network")
 device = mobile_net.add_bottom("Device")

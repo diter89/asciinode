@@ -9,14 +9,14 @@ def build_network() -> Diagram:
         max_box_width=40,
         canvas_width=500,
         canvas_height=150,
-        box_style="square",
+        box_style="rounded",
     )
 
     api_tier = diagram.add_right("▲ [bold red]API Tier[/bold red]")
     data_flow = diagram.add_bottom("◆ [bold magenta]Data Flow[/bold magenta]")
     operations = diagram.add_left("☑ [bold green]Operations[/bold green]")
 
-    api_gateway = api_tier.add_bottom("▶ [bold]API Gateway[/bold]")
+    api_gateway = api_tier.add_bottom("apa itu Gateway ?",title="▶ API Gateway",llm_answer=False)
     cache_cluster = api_gateway.add_bottom("◼ Cache Cluster")
     auth_service = cache_cluster.add_bottom("✚ Auth Service")
     billing_service = auth_service.add_bottom("⊕ Billing Service")

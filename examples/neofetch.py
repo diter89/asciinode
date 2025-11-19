@@ -374,7 +374,7 @@ def main() -> None:
                 loop_time = (perf_counter() - loop_start) * 1000
 
                 panel_text = f"{rendered}\n\nRender: {render_time:.1f} ms | Loop: {loop_time:.1f} ms"
-                live.update(Panel(panel_text, title="LIVE NEOFETCH", border_style="cyan"))
+                live.update(panel_text)
 
                 sleep(1)
     except KeyboardInterrupt:

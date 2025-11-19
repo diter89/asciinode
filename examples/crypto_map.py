@@ -1,3 +1,4 @@
+from multiprocessing.context import SpawnContext
 from asciinode.ascii_diagram import Diagram as _basediagram
 from rich import print
 
@@ -11,9 +12,9 @@ class Diagram(_basediagram):
 def create_blockchain_ecosystem() -> Diagram:
     diagram = Diagram(
         "Blockchain Ecosystem with DeFi & Layer-2 Scaling",
-        horizontal_spacing=8,
-        vertical_spacing=7,
         allow_intersections=False,
+        horizontal_spacing=7,
+        vertical_spacing=5,
         box_style="square",
     )
 
@@ -63,12 +64,20 @@ def create_blockchain_ecosystem() -> Diagram:
     diagram.connect(bitcoin, ethereum, label="wBTC", bidirectional=True)
     diagram.connect(ethereum, solana, label="cross-chain", bidirectional=True)
     diagram.connect(ethereum, arbitrum, label="bridged ETH", bidirectional=True)
-    diagram.connect(arbitrum, optimism, label="L2 bridge", bidirectional=True, style="[blue bold]")
+    diagram.connect(
+        arbitrum, optimism, label="L2 bridge", bidirectional=True, style="[blue bold]"
+    )
 
     diagram.connect(uniswap, aave, label="liquidity", bidirectional=True, style="[red]")
-    diagram.connect(aave, compound, label="yield farming", bidirectional=True, style="[red]")
-    diagram.connect(uniswap, sushiswap, label="LP migration", bidirectional=True, style="[green]")
-    diagram.connect(curve, balancer, label="stable swaps", bidirectional=True, style="[green]")
+    diagram.connect(
+        aave, compound, label="yield farming", bidirectional=True, style="[red]"
+    )
+    diagram.connect(
+        uniswap, sushiswap, label="LP migration", bidirectional=True, style="[green]"
+    )
+    diagram.connect(
+        curve, balancer, label="stable swaps", bidirectional=True, style="[green]"
+    )
 
     diagram.connect(opensea, blur, label="listings", bidirectional=True)
     diagram.connect(blur, looksrare, label="bids", bidirectional=True)
@@ -77,14 +86,18 @@ def create_blockchain_ecosystem() -> Diagram:
     diagram.connect(chainlink, uniswap, label="price feeds", bidirectional=True)
     diagram.connect(chainlink, aave, label="oracle data", bidirectional=True)
     diagram.connect(the_graph, uniswap, label="subgraph queries", bidirectional=True)
-    diagram.connect(pyth, solana, label="low-latency data", bidirectional=True, style="[yellow]")
+    diagram.connect(
+        pyth, solana, label="low-latency data", bidirectional=True, style="[yellow]"
+    )
 
     diagram.connect(layerzero, ethereum, label="omnichain", bidirectional=True)
     diagram.connect(wormhole, solana, label="message passing", bidirectional=True)
     diagram.connect(axelar, polygon, label="interchain", bidirectional=True)
 
     diagram.connect(lido, ethereum, label="stETH", bidirectional=True)
-    diagram.connect(rocketpool, ethereum, label="rETH", bidirectional=True, style="[#0a7e89]")
+    diagram.connect(
+        rocketpool, ethereum, label="rETH", bidirectional=True, style="[#0a7e89]"
+    )
     diagram.connect(frax_ether, ethereum, label="frxETH", bidirectional=True)
 
     diagram.connect(binance, bitcoin, label="trading pairs", bidirectional=True)
@@ -108,6 +121,7 @@ def main():
 
     result = diagram.render(include_markup=True, fit_to_terminal=True)
     print(result)
+
 
 if __name__ == "__main__":
     main()

@@ -5,8 +5,7 @@ from typing import Any, Dict, List, Mapping, Optional
 import requests
 
 
-#DEFAULT_MODEL = "accounts/sentientfoundation/models/dobby-unhinged-llama-3-3-70b-new"
-DEFAULT_MODEL = "accounts/sentientfoundation-serverless/models/dobby-mini-unhinged-plus-llama-3-1-8b"
+DEFAULT_MODEL = "accounts/sentientfoundation/models/dobby-unhinged-llama-3-3-70b-new"
 DEFAULT_URL = "https://api.fireworks.ai/inference/v1/chat/completions"
 
 
