@@ -50,6 +50,11 @@ prompt = "User request flows through frontend -> api -> database"
 diagram = generate_diagram(prompt)
 print(diagram.render(include_markup=True))
 ```
+Set the Fireworks API key before running the LLM helper:
+
+```bash
+export FIREWORKS_API_KEY="fw_xxx"
+```
 
 ### Embedding LLM answers inside existing diagrams
 
@@ -271,6 +276,74 @@ Traceroute Analysis
                   │   * * *    │                      │   * * *    │                      │   Timeout  │
                   ╰────────────╯                      ╰────────────╯                      │   * * *    │
                                                                                           ╰────────────╯
+
+
+Simple Tree
+          ╭────────╮
+          │ Server │
+          ╰────────╯
+               │
+      ╭────────┼───────╮
+      │                │
+      ▼                ▼
+╭───────────╮    ╭───────────╮
+│ Layanan 1 │    │ Layanan 2 │
+╰───────────╯    ╰───────────╯
+
+Complex Tree
+                     ╭──────╮
+                     │ Root │
+                     ╰──────╯
+                         │
+                  ╭──────┼───────────────────╮
+                  │                          │
+                  ▼                          ▼
+             ╭─────────╮                ╭─────────╮
+             │ Child 1 │                │ Child 2 │
+             ╰─────────╯                ╰─────────╯
+                  │
+        ╭─────────┼─────────╮
+        │                   │
+        ▼                   ▼
+╭──────────────╮    ╭──────────────╮
+│ Grandchild 1 │    │ Grandchild 2 │
+╰──────────────╯    ╰──────────────╯
+
+Multiple Positions
+╭───────╮    ╭─────────────╮    ╭──────────╮
+│ Cache │ ◄──│ Main Server │───►│ Database │
+╰───────╯    ╰─────────────╯    ╰──────────╯
+                    │
+                    │
+                    │
+                    ▼
+             ╭─────────────╮
+             │ API Gateway │
+             ╰─────────────╯
+
+Multi-level
+                ╭───────────────╮
+                │ Load Balancer │
+                ╰───────────────╯
+                        │
+                      ╭─┤
+                      │ │
+                      ▼ │
+   ╭───────╮    ╭───────┼──╮    ╭───────────╮
+   │ Redis │ ◄──│ Server│1 │───►│ DB Master │
+   ╰───────╯    ╰───────┼──╯    ╰───────────╯
+    ╭───────╮           │
+    │ hello │           │
+    ╰───────╯           │
+        ▲               │
+        │               │
+        │               ├─╮
+        │                 │
+        │                 ▼
+╭──────────────╮    ╭──────────╮    ╭──────────╮
+│ Cache Mirror │ ◄──│ Server 2 │───►│ DB Slave │
+╰──────────────╯    ╰──────────╯    ╰──────────╯
+
 
 ```
 ## Examples
